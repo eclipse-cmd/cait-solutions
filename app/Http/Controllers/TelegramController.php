@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\Telegram as TelegramModel;
+use App\Models\TelegramGroup;
 use App\Services\ApiResponseService;
 use Illuminate\Http\Request;
 use Telegram\Bot\Laravel\Facades\Telegram;
@@ -21,56 +22,39 @@ class TelegramController extends Controller
             if ($update->isType('message')) {
                 $message = $update->getMessage();
                 $chat = $message->getChat();
-                $telegramId = $chat->getId();
-                $payload = [
-                    'username' => $chat->getUsername(),
-                    'first_name' => $chat->getFirstName(),
-                    'last_name' => $chat->getLastName(),
+                $chatType = $chat->getType();
+
+                $from = $message->getFrom();
+                $userId = $from->getId();
+                $userPayload = [
+                    'username' => $from->getUsername(),
+                    'first_name' => $from->getFirstName(),
+                    'last_name' => $from->getLastName(),
                 ];
-                $taskService = app(TelegramTaskService::class);
 
-                $user = TelegramModel::where('telegram_id', $telegramId)->first();
-                if (!$user && !in_array($message->getText(), ['/start', '/help'])) {
-                    Telegram::sendMessage([
-                        'chat_id' => $chat->getId(),
-                        'text' => 'You are not authorized. Please use /start to register.'
-                    ]);
-                    return response('OK', 200);
+                // Handle group chat setup and user registration
+                if (in_array($chatType, ['group', 'supergroup'])) {
+                    $this->handleGroupMessage($chat, $message, $from, $taskService);
+                } else {
+                    // Handle private messages (existing logic)
+                    $this->handlePrivateMessage($chat, $message, $from, $taskService);
                 }
 
-                // Attachment file 
-                $state = cache("tg:{$telegramId}:state");
+                // Handle file attachments (works for both private and group)
+                $state = cache("tg:{$userId}:state");
                 if ($state === 'awaiting_file_upload' && ($message->getDocument() || $message->getPhoto())) {
-                    $taskId = cache("tg:{$telegramId}:attach_task_id");
-                    $task = $user ? $user->tasks()->find($taskId) : null;
-                    if ($task) {
-                        if ($message->getDocument()) {
-                            $fileId = $message->getDocument()->getFileId();
-                            $fileName = $message->getDocument()->getFileName();
-                            $fileType = $message->getDocument()->getMimeType();
-                        } else {
-                            $photo = $message->getPhoto();
-                            $fileId = $photo[count($photo) - 1]->getFileId();
-                            $fileName = null;
-                            $fileType = 'photo';
-                        }
-                        $taskService->attachFileToTask($task, $fileId, $fileType, $fileName);
-                        Telegram::sendMessage([
-                            'chat_id' => $chat->getId(),
-                            'text' => 'File uploaded has been attached to file..'
-                        ]);
-                    } else {
-                        Telegram::sendMessage([
-                            'chat_id' => $chat->getId(),
-                            'text' => 'Task not found or not you are not authorized.'
-                        ]);
-                    }
-                    cache()->forget("tg:{$telegramId}:state");
-                    cache()->forget("tg:{$telegramId}:attach_task_id");
+                    $this->handleFileUpload($message, $userId, $taskService);
                     return response('OK', 200);
                 }
+
                 $text = $message->getText();
-                $this->handleMessageAction($chat, $text, $telegramId, $payload, $taskService);
+                if ($text) {
+                    if (in_array($chatType, ['group', 'supergroup'])) {
+                        $this->handleGroupMessageAction($chat, $text, $from, $userPayload, $taskService);
+                    } else {
+                        $this->handleMessageAction($chat, $text, $userId, $userPayload, $taskService);
+                    }
+                }
             } elseif ($update->isType('callback_query')) {
                 $callback = $update->getCallbackQuery();
                 $this->handleCallbackAction($callback, $taskService);
@@ -115,6 +99,246 @@ class TelegramController extends Controller
             return ApiResponseService::success('Message sent successfully!');
         } catch (\Exception $e) {
             return ApiResponseService::error($e->getMessage());
+        }
+    }
+
+
+    private function handleGroupMessage($chat, $message, $from, $taskService)
+    {
+        $chatId = $chat->getId();
+        $userId = $from->getId();
+
+        // Register/update group information
+        TelegramGroup::updateOrCreate(
+            ['chat_id' => $chatId],
+            [
+                'title' => $chat->getTitle(),
+                'type' => $chat->getType(),
+                'is_active' => true
+            ]
+        );
+
+        // Register user if not exists
+        TelegramModel::updateOrCreate(
+            ['telegram_id' => $userId],
+            [
+                'username' => $from->getUsername(),
+                'first_name' => $from->getFirstName(),
+                'last_name' => $from->getLastName(),
+            ]
+        );
+
+        // Associate user with group
+        $user = TelegramModel::where('telegram_id', $userId)->first();
+        $group = TelegramGroup::where('chat_id', $chatId)->first();
+
+        if ($user && $group) $user->groups()->syncWithoutDetaching([$group->id]);
+    }
+
+    private function handlePrivateMessage($chat, $message, $from, $taskService)
+    {
+        $userId = $from->getId();
+
+        $user = TelegramModel::where('telegram_id', $userId)->first();
+        if (!$user && !in_array($message->getText(), ['/start', '/help'])) {
+            Telegram::sendMessage([
+                'chat_id' => $chat->getId(),
+                'text' => 'You are not authorized. Please use /start to register.'
+            ]);
+            return;
+        }
+    }
+
+    private function handleFileUpload($message, $userId, $taskService)
+    {
+        $taskId = cache("tg:{$userId}:attach_task_id");
+        $user = TelegramModel::where('telegram_id', $userId)->first();
+        $task = $user ? $user->tasks()->find($taskId) : null;
+
+        if ($task) {
+            if ($message->getDocument()) {
+                $fileId = $message->getDocument()->getFileId();
+                $fileName = $message->getDocument()->getFileName();
+                $fileType = $message->getDocument()->getMimeType();
+            } else {
+                $photo = $message->getPhoto();
+                $fileId = $photo[count($photo) - 1]->getFileId();
+                $fileName = null;
+                $fileType = 'photo';
+            }
+
+            $taskService->attachFileToTask($task, $fileId, $fileType, $fileName);
+
+            $this->notifyGroupsAboutTaskUpdate($user, $task, "File attached to task: {$task->title}");
+
+            Telegram::sendMessage([
+                'chat_id' => $message->getChat()->getId(),
+                'text' => 'File uploaded has been attached to task.'
+            ]);
+        }
+
+        cache()->forget("tg:{$userId}:state");
+        cache()->forget("tg:{$userId}:attach_task_id");
+    }
+
+    public function handleGroupMessageAction($chat, $text, $from, $userPayload, $taskService)
+    {
+        $chatId = $chat->getId();
+        $userId = $from->getId();
+        $botUsername = config('telegram.bot_username');
+
+        // Only respond to commands that mention the bot or are direct commands
+        if (!$this->isMessageForBot($text, $botUsername)) return;
+
+        $cleanText = $this->cleanCommand($text, $botUsername);
+
+        switch ($cleanText) {
+            case '/start':
+                $greetingName = strtoupper($from->getFirstName()) ?: 'There';
+                $response = "Hello, $greetingName! I'm now active in this group.\nUse /help@{$botUsername} to see available commands.";
+                Telegram::sendMessage(['chat_id' => $chatId, 'text' => $response]);
+                break;
+
+            case '/help':
+                $response = "Group Commands:\n\n"
+                    . "/newtask@{$botUsername} - Create a new task\n"
+                    . "/mytasks@{$botUsername} - List your tasks\n"
+                    . "/grouptasks@{$botUsername} - List all group tasks\n"
+                    . "/searchtasks@{$botUsername} - Search for tasks\n"
+                    . "/attachfile@{$botUsername} - Attach file to task\n"
+                    . "/tasknotify@{$botUsername} on/off - Toggle task notifications\n";
+                Telegram::sendMessage(['chat_id' => $chatId, 'text' => $response]);
+                break;
+
+            case '/grouptasks':
+                $this->handleGroupTasks($chatId, $taskService);
+                break;
+
+            case '/tasknotify':
+                $this->handleTaskNotifyToggle($chatId, $userId);
+                break;
+
+            default:
+                $this->handleGroupStateResponse($chatId, $userId, $cleanText, $taskService);
+                break;
+        }
+    }
+
+    private function handleGroupTasks($chatId, $taskService)
+    {
+        $group = TelegramGroup::where('chat_id', $chatId)->first();
+        if (!$group) return;
+
+        $tasks = collect();
+        foreach ($group->users as $user) {
+            $userTasks = $taskService->listTasks($user);
+            $tasks = $tasks->merge($userTasks);
+        }
+
+        if ($tasks->isEmpty()) {
+            Telegram::sendMessage([
+                'chat_id' => $chatId,
+                'text' => 'No tasks found in this group.'
+            ]);
+            return;
+        }
+
+        foreach ($tasks->take(10) as $task) { // I added limit here to prevent spam
+            $owner = $task->user;
+            $textMsg = "TASK: {$task->title}\n"
+                . "Owner: {$owner->first_name} {$owner->last_name}\n"
+                . "Status: {$task->status->value}\n"
+                . "Description: " . substr($task->description, 0, 100) . "...";
+
+            Telegram::sendMessage([
+                'chat_id' => $chatId,
+                'text' => $textMsg
+            ]);
+        }
+    }
+
+    private function handleTaskNotifyToggle($chatId, $userId)
+    {
+        $group = TelegramGroup::where('chat_id', $chatId)->first();
+        if (!$group) return;
+
+        // Toggle notification setting for this user in this group
+        $pivot = $group->users()->where('telegram_id', $userId)->first();
+        if ($pivot) {
+            $currentSetting = $pivot->pivot->notifications_enabled ?? true;
+            $group->users()->updateExistingPivot($pivot->id, [
+                'notifications_enabled' => !$currentSetting
+            ]);
+
+            $status = !$currentSetting ? 'enabled' : 'disabled';
+            Telegram::sendMessage([
+                'chat_id' => $chatId,
+                'text' => "Task notifications {$status} for you in this group."
+            ]);
+        }
+    }
+
+    private function isMessageForBot($text, $botUsername)
+    {
+        return str_starts_with($text, '/') &&
+            (str_contains($text, "@{$botUsername}") || !str_contains($text, '@'));
+    }
+
+    private function cleanCommand($text, $botUsername)
+    {
+        return str_replace("@{$botUsername}", '', $text);
+    }
+
+    private function handleGroupStateResponse($chatId, $userId, $text, $taskService)
+    {
+        $state = cache("tg:{$userId}:state");
+        $user = TelegramModel::where('telegram_id', $userId)->first();
+
+        if ($state === 'awaiting_task_title') {
+            cache(["tg:{$userId}:task_title" => $text], now()->addMinutes(10));
+            cache(["tg:{$userId}:state" => 'awaiting_task_description'], now()->addMinutes(10));
+            Telegram::sendMessage([
+                'chat_id' => $chatId,
+                'text' => "Please send the task description."
+            ]);
+        } elseif ($state === 'awaiting_task_description') {
+            $title = cache("tg:{$userId}:task_title");
+            if ($user && $title) {
+                $task = $taskService->createTask($user, $title, $text);
+
+                // Notify the group about new task
+                $this->notifyGroupsAboutTaskUpdate($user, $task, "New task created: {$task->title}");
+
+                Telegram::sendMessage([
+                    'chat_id' => $chatId,
+                    'text' => "Task '{$task->title}' created successfully!"
+                ]);
+            }
+            cache()->forget("tg:{$userId}:state");
+            cache()->forget("tg:{$userId}:task_title");
+        }
+    }
+
+    public function notifyGroupsAboutTaskUpdate($user, $task, $message)
+    {
+        // Get all groups the user belongs to
+        $groups = $user->groups()->where('is_active', true)->get();
+
+        foreach ($groups as $group) {
+            // Check if notifications are enabled for users in this group
+            $notifyUsers = $group->users()
+                ->wherePivot('notifications_enabled', true)
+                ->orWherePivotNull('notifications_enabled')
+                ->get();
+
+            if ($notifyUsers->count() > 0) {
+                $fullMessage = "🔔 Task Update\n\n{$message}\n\nBy: {$user->first_name} {$user->last_name}";
+
+                Telegram::sendMessage([
+                    'chat_id' => $group->chat_id,
+                    'text' => $fullMessage
+                ]);
+            }
         }
     }
 

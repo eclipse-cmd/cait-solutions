@@ -42,6 +42,9 @@ return [
         ],
     ],
 
+    'bot_username' => env('TELEGRAM_BOT_USERNAME', 'v1_cait_bot'),
+    'bot_token' => env('TELEGRAM_BOT_TOKEN', ''),
+
     /*
     |--------------------------------------------------------------------------
     | Default Bot Name
@@ -51,7 +54,7 @@ return [
     | your default bot for regular use.
     |
     */
-    'default' => 'v1_cait_bot',
+    'default' => env('TELEGRAM_BOT_USERNAME', 'v1_cait_bot'),
 
     /*
     |--------------------------------------------------------------------------

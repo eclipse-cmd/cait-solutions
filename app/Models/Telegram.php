@@ -17,4 +17,23 @@ class Telegram extends Model
     {
         return $this->hasMany(Task::class, 'user_id', 'id');
     }
+
+    public function groups()
+    {
+        return $this->belongsToMany(TelegramGroup::class, 'telegram_group_users', 'user_id', 'group_id', 'id', 'id')
+            ->withPivot(['notifications_enabled', 'joined_at', 'role', 'is_active'])
+            ->withTimestamps();
+    }
+
+    public function getFullNameAttribute()
+    {
+        return trim($this->first_name . ' ' . $this->last_name);
+    }
+
+    public function getActiveGroupsAttribute()
+    {
+        return $this->groups()->where('telegram_groups.is_active', true)
+            ->wherePivot('is_active', true)
+            ->get();
+    }
 }
