@@ -185,11 +185,13 @@ class TelegramController extends Controller
     {
         $chatId = $chat->getId();
         $userId = $from->getId();
-        $botUsername = config('telegram.bot_username');
+        $botUsername = config('telegram.bots.mybot.username'); // Configure this
 
         // Only respond to commands that mention the bot or are direct commands
         if (!$this->isMessageForBot($text, $botUsername)) return;
 
+
+        // Clean the command (remove bot mention)
         $cleanText = $this->cleanCommand($text, $botUsername);
 
         switch ($cleanText) {
@@ -210,8 +212,24 @@ class TelegramController extends Controller
                 Telegram::sendMessage(['chat_id' => $chatId, 'text' => $response]);
                 break;
 
+            case '/newtask':
+                $this->handleGroupNewTask($chatId, $userId);
+                break;
+
+            case '/mytasks':
+                $this->handleGroupMyTasks($chatId, $userId, $taskService);
+                break;
+
             case '/grouptasks':
                 $this->handleGroupTasks($chatId, $taskService);
+                break;
+
+            case '/searchtasks':
+                $this->handleGroupSearchTasks($chatId, $userId);
+                break;
+
+            case '/attachfile':
+                $this->handleGroupAttachFile($chatId, $userId);
                 break;
 
             case '/tasknotify':
@@ -219,9 +237,19 @@ class TelegramController extends Controller
                 break;
 
             default:
+                // Handle state-based responses for group chats
                 $this->handleGroupStateResponse($chatId, $userId, $cleanText, $taskService);
                 break;
         }
+    }
+
+    private function handleGroupAttachFile($chatId, $userId)
+    {
+        Telegram::sendMessage([
+            'chat_id' => $chatId,
+            'text' => 'Please enter the Task ID you want to attach a file to.'
+        ]);
+        cache(["tg:{$userId}:state" => 'awaiting_attach_task_id'], now()->addMinutes(10));
     }
 
     private function handleGroupTasks($chatId, $taskService)
@@ -276,6 +304,70 @@ class TelegramController extends Controller
                 'text' => "Task notifications {$status} for you in this group."
             ]);
         }
+    }
+
+    private function handleGroupNewTask($chatId, $userId)
+    {
+        Telegram::sendMessage([
+            'chat_id' => $chatId,
+            'text' => 'Please enter the task title.'
+        ]);
+        // Store state in cache for next message
+        cache(["tg:{$userId}:state" => 'awaiting_task_title'], now()->addMinutes(10));
+    }
+
+    private function handleGroupMyTasks($chatId, $userId, $taskService)
+    {
+        $user = TelegramModel::where('telegram_id', $userId)->first();
+        if (!$user) {
+            Telegram::sendMessage([
+                'chat_id' => $chatId,
+                'text' => 'User not found. Please use /start first.'
+            ]);
+            return;
+        }
+
+        $tasks = $taskService->listTasks($user);
+        if ($tasks->isEmpty()) {
+            Telegram::sendMessage([
+                'chat_id' => $chatId,
+                'text' => 'You have no tasks. Use /newtask to create one.'
+            ]);
+            return;
+        }
+
+        $firstName = $user->first_name;
+        Telegram::sendMessage([
+            'chat_id' => $chatId,
+            'text' => "📋 Tasks for {$firstName}:"
+        ]);
+
+        foreach ($tasks->take(5) as $task) { // Limit to 5 tasks in group to prevent spam
+            $keyboard = self::taskActionKeyboard($task->id);
+            $textMsg = "TASK DATA\n\nID: {$task->id}\nTitle: {$task->title}\nStatus: {$task->status->value}\nDescription: " . substr($task->description, 0, 100) . (strlen($task->description) > 100 ? '...' : '');
+
+            Telegram::sendMessage([
+                'chat_id' => $chatId,
+                'text' => $textMsg,
+                'reply_markup' => json_encode(['inline_keyboard' => $keyboard])
+            ]);
+        }
+
+        if ($tasks->count() > 5) {
+            Telegram::sendMessage([
+                'chat_id' => $chatId,
+                'text' => "... and " . ($tasks->count() - 5) . " more tasks. Use private chat for full list."
+            ]);
+        }
+    }
+
+    private function handleGroupSearchTasks($chatId, $userId)
+    {
+        Telegram::sendMessage([
+            'chat_id' => $chatId,
+            'text' => 'Please enter your search query.'
+        ]);
+        cache(["tg:{$userId}:state" => 'awaiting_search_query'], now()->addMinutes(10));
     }
 
     private function isMessageForBot($text, $botUsername)
@@ -522,8 +614,26 @@ class TelegramController extends Controller
     public static function handleCallbackAction($callback, $taskService)
     {
         $data = $callback->getData();
-        $chatId = $callback->getMessage()->getChat()->getId();
-        $user = TelegramModel::where('telegram_id', $chatId)->first();
+        $message = $callback->getMessage();
+        $chat = $message->getChat();
+        $chatId = $chat->getId();
+        $chatType = $chat->getType();
+
+        // Get the user who pressed the button
+        $from = $callback->getFrom();
+        $userId = $from->getId();
+
+        $user = TelegramModel::where('telegram_id', $userId)->first();
+
+        if (!$user) {
+            Telegram::answerCallbackQuery([
+                'callback_query_id' => $callback->getId(),
+                'text' => 'User not found. Please use /start first.',
+                'show_alert' => true
+            ]);
+            return;
+        }
+
         if (str_starts_with($data, 'edit_task_')) {
             $taskId = str_replace('edit_task_', '', $data);
             $task = $user->tasks()->find($taskId);
@@ -534,36 +644,75 @@ class TelegramController extends Controller
                         ['text' => 'Edit Description', 'callback_data' => 'edit_desc_' . $taskId],
                     ]
                 ];
+
+                // For group chats, include user mention
+                $responseText = in_array($chatType, ['group', 'supergroup'])
+                    ? "What do you want to edit for task '{$task->title}'?"
+                    : 'What do you want to edit?';
+
                 Telegram::sendMessage([
                     'chat_id' => $chatId,
-                    'text' => 'What do you want to edit?',
+                    'text' => $responseText,
                     'reply_markup' => json_encode(['inline_keyboard' => $keyboard])
+                ]);
+
+                Telegram::answerCallbackQuery(['callback_query_id' => $callback->getId()]);
+            } else {
+                Telegram::answerCallbackQuery([
+                    'callback_query_id' => $callback->getId(),
+                    'text' => 'Task not found or not authorized.',
+                    'show_alert' => true
                 ]);
             }
         } elseif (str_starts_with($data, 'edit_title_')) {
             $taskId = str_replace('edit_title_', '', $data);
-            cache(["tg:{$chatId}:edit_task_id" => $taskId], now()->addMinutes(10));
-            cache(["tg:{$chatId}:state" => 'awaiting_edit_title'], now()->addMinutes(10));
-            Telegram::sendMessage([
-                'chat_id' => $chatId,
-                'text' => 'Enter new title for the task.'
-            ]);
+            $task = $user->tasks()->find($taskId);
+            if ($task) {
+                cache(["tg:{$userId}:edit_task_id" => $taskId], now()->addMinutes(10));
+                cache(["tg:{$userId}:state" => 'awaiting_edit_title'], now()->addMinutes(10));
+
+                Telegram::sendMessage([
+                    'chat_id' => $chatId,
+                    'text' => "Enter new title for task: {$task->title}"
+                ]);
+
+                Telegram::answerCallbackQuery(['callback_query_id' => $callback->getId()]);
+            }
         } elseif (str_starts_with($data, 'edit_desc_')) {
             $taskId = str_replace('edit_desc_', '', $data);
-            cache(["tg:{$chatId}:edit_task_id" => $taskId], now()->addMinutes(10));
-            cache(["tg:{$chatId}:state" => 'awaiting_edit_description'], now()->addMinutes(10));
-            Telegram::sendMessage([
-                'chat_id' => $chatId,
-                'text' => 'Enter new description for the task.'
-            ]);
+            $task = $user->tasks()->find($taskId);
+            if ($task) {
+                cache(["tg:{$userId}:edit_task_id" => $taskId], now()->addMinutes(10));
+                cache(["tg:{$userId}:state" => 'awaiting_edit_description'], now()->addMinutes(10));
+
+                Telegram::sendMessage([
+                    'chat_id' => $chatId,
+                    'text' => "Enter new description for task: {$task->title}"
+                ]);
+
+                Telegram::answerCallbackQuery(['callback_query_id' => $callback->getId()]);
+            }
         } elseif (str_starts_with($data, 'delete_task_')) {
             $taskId = str_replace('delete_task_', '', $data);
             $task = $user->tasks()->find($taskId);
             if ($task) {
+                $taskTitle = $task->title;
                 $taskService->deleteTask($task);
+
                 Telegram::sendMessage([
                     'chat_id' => $chatId,
-                    'text' => 'Task "' . $task->title . '" deleted.'
+                    'text' => "✅ Task \"{$taskTitle}\" deleted successfully."
+                ]);
+
+                Telegram::answerCallbackQuery([
+                    'callback_query_id' => $callback->getId(),
+                    'text' => 'Task deleted successfully!'
+                ]);
+            } else {
+                Telegram::answerCallbackQuery([
+                    'callback_query_id' => $callback->getId(),
+                    'text' => 'Task not found or not authorized.',
+                    'show_alert' => true
                 ]);
             }
         } elseif (str_starts_with($data, 'status_task_')) {
@@ -575,20 +724,36 @@ class TelegramController extends Controller
                     ['text' => 'In Progress', 'callback_data' => 'setstatus_' . $taskId . '_IN_PROGRESS'],
                     ['text' => 'Completed', 'callback_data' => 'setstatus_' . $taskId . '_COMPLETED'],
                 ];
+
                 Telegram::sendMessage([
                     'chat_id' => $chatId,
-                    'text' => 'Choose new status:',
+                    'text' => "Choose new status for task: {$task->title}",
                     'reply_markup' => json_encode(['inline_keyboard' => [$statuses]])
                 ]);
+
+                Telegram::answerCallbackQuery(['callback_query_id' => $callback->getId()]);
             }
         } elseif (str_starts_with($data, 'setstatus_')) {
             [$prefix, $taskId, $status] = explode('_', $data, 3);
             $task = $user->tasks()->find($taskId);
             if ($task) {
+                $oldStatus = $task->status->value;
                 $taskService->updateTaskStatus($task, $status);
+
                 Telegram::sendMessage([
                     'chat_id' => $chatId,
-                    'text' => "Task status updated to $status."
+                    'text' => "✅ Task status updated from {$oldStatus} to {$status} for: {$task->title}"
+                ]);
+
+                Telegram::answerCallbackQuery([
+                    'callback_query_id' => $callback->getId(),
+                    'text' => "Status updated to {$status}!"
+                ]);
+            } else {
+                Telegram::answerCallbackQuery([
+                    'callback_query_id' => $callback->getId(),
+                    'text' => 'Task not found or not authorized.',
+                    'show_alert' => true
                 ]);
             }
         }
