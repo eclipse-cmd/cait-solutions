@@ -128,7 +128,7 @@ class TelegramController extends Controller
             ]
         );
 
-        // Associate user with group
+        // Sync user with group
         $user = TelegramModel::where('telegram_id', $userId)->first();
         $group = TelegramGroup::where('chat_id', $chatId)->first();
 
@@ -185,13 +185,10 @@ class TelegramController extends Controller
     {
         $chatId = $chat->getId();
         $userId = $from->getId();
-        $botUsername = config('telegram.bots.mybot.username'); // Configure this
-
-        // Only respond to commands that mention the bot or are direct commands
+        $botUsername = config('telegram.bot_username');
         if (!$this->isMessageForBot($text, $botUsername)) return;
 
-
-        // Clean the command (remove bot mention)
+        // Register or update user in the group
         $cleanText = $this->cleanCommand($text, $botUsername);
 
         switch ($cleanText) {
@@ -312,7 +309,7 @@ class TelegramController extends Controller
             'chat_id' => $chatId,
             'text' => 'Please enter the task title.'
         ]);
-        // Store state in cache for next message
+
         cache(["tg:{$userId}:state" => 'awaiting_task_title'], now()->addMinutes(10));
     }
 
@@ -417,7 +414,6 @@ class TelegramController extends Controller
         $groups = $user->groups()->where('is_active', true)->get();
 
         foreach ($groups as $group) {
-            // Check if notifications are enabled for users in this group
             $notifyUsers = $group->users()
                 ->wherePivot('notifications_enabled', true)
                 ->orWherePivotNull('notifications_enabled')
@@ -458,6 +454,7 @@ class TelegramController extends Controller
                     'chat_id' => $chat->getId(),
                     'text' => 'Please enter the task title.'
                 ]);
+
                 // Store state in cache or DB for next message
                 cache(["tg:{$telegramId}:state" => 'awaiting_task_title'], now()->addMinutes(10));
                 break;
